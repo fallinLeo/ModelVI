@@ -1,0 +1,299 @@
+#include <Servo.h>
+#include <math.h>
+#include <SoftwareSerial.h>
+
+SoftwareSerial s(7,8);    // 7:RX 8:TX
+
+//========= 상보필터 적용 변수 start=============
+#define SIZE 5
+int buffer[SIZE];
+int buffer2[SIZE];
+int buffer3[SIZE];
+float EMA_a = 0.2;    
+int EMA_S=0;
+
+float volts,volts2,volts3;
+int sensorValue,sensorValue2,sensorValue3;
+float volts_dirt,volts_dirt2,volts_dirt3;
+float ir_distance,ir_distance3,ir_distance2; //check value
+float ir_dis,ir_dis2,ir_dis3;
+float sum,sum2,sum3;
+float EMA_S_pre=0,EMA_S_pre2=0,EMA_S_pre3=0;
+//=============상보필터 적용 변수 end ===============
+
+
+
+const int AIA = 11;  //왼쪽 모터 방향
+const int AIB = 6;   //왼쪽 모터 속도
+const int BIA = 3;   //오른쪽 모터 방향
+const int BIB = 5;   //오른쪽 모터 속도
+int psd1 = A0; //psd센서 정의
+int psd2 = A1;
+int psd3 = A2; 
+long first1=millis(); // psd센서값 시리얼모니터로 추출
+long first2=millis();
+long last1,last2;
+
+int adelt; // delaytime 리턴값
+
+float F_Dist, L_Dist, R_Dist; //Front dist,Left dist, Right dist
+float F_Sensor,R_Sensor,L_Sensor;
+const int Dist_Min = 27; //정면거리 최소거리 도출 센서값
+const int LR_Dist_Min = 31; //왼쪽, 오른쪽 최소거리  도출 센서값
+int Max_speed1 = 200; //전진 속도
+int Max_speed2 = 180; //회전 속도
+float delay_t = 130; //모터 회전 delaytime 초기값 
+
+float Rotate_t() { //장애물과 자동차간의 각도를 도출하기 위한 알고리즘 함수
+  float delta; //자동차와 장애물간의 각도
+  float delaytime; //각도를 이용해 모터를 돌릴 delaytime
+
+//7개의 상보필터 적용한 psd센서를 cm단위의 거리와 매칭해서 추세선분석 사용 
+  F_Sensor = -2.3643*F_Dist+82.955; // 추세선분석을 이용해 센서값을 거리값(단위cm)로 반환
+  L_Sensor = -1.9531*L_Dist+71.252;
+  R_Sensor = -1.7966*R_Dist+66.825;
+  if(L_Sensor<R_Sensor) // 오른쪽 장애물거리보다 왼쪽 장애물이 더 가깝다면(예각 사용하기 위함)
+  {
+    delta = atan(L_Sensor/(1.4142135*F_Sensor-L_Sensor)); // 사진첨부
+    delaytime = delta * 200*180/(30*3.141592); // 라디안 값을 디그리 값으로 단위환산. 200값은 실험적으로 구한 초기
+  //delaytime 상수
+    delaytime = constrain(delaytime,-120,120); //최대값과 최소값 내의 값만 사용하기 위한 함수
+  }
+  else if(L_Sensor>R_Sensor) //왼쪽 장애물보다 오른쪽 장애물이 더 가깝다면(예각 사용)
+  {
+    delta = atan(R_Sensor/(1.4142135*F_Sensor-R_Sensor));
+    delaytime = delta * 200*180/(30*3.141592);
+    delaytime = constrain(delaytime,-120,120);
+    
+  }
+  else //센서값 및 함수 계산이 튀는 경우 방지
+  {
+    delaytime = 120;
+  }
+  adelt=abs(delaytime); // 절대값으로 반환
+  return adelt;
+}
+
+
+
+void setup() {
+  Serial.begin(9600);
+  s.begin(9600);
+  pinMode(AIA, OUTPUT);
+  pinMode(AIB, OUTPUT);
+  pinMode(BIA, OUTPUT);
+  pinMode(BIB, OUTPUT);
+  pinMode(psd1,INPUT);
+  pinMode(psd2,INPUT);
+  pinMode(psd3,INPUT);
+}
+
+
+
+void loop() {
+  last1=millis();
+  last2=millis();
+  delay_t=Rotate_t(); //회전값 반환 함수
+  F_Dist=F_Filter(); //정면, 좌측,우측 상보필터 적용
+  R_Dist=R_Filter();
+  L_Dist=L_Filter();
+  Sensor_print(); //센서값 
+  forward(); //기본적으로 직진 수행
+  Look_brake(); //장애물 인식 후 회전 함수
+  
+}
+
+
+
+void Sensor_print() // 센서값 Serial Monitor로 추출함수
+{
+  if(last1-first1==1000)
+  {
+    Serial.print("Front Sensor : ");
+    Serial.println(F_Dist);
+    Serial.print("R45_SENSOR : ");
+    Serial.println(R_Dist);
+    Serial.print("L45_Sensor : ");
+    Serial.println(L_Dist);
+    //Serial.println(delay_t);
+    first1=last1;
+  }
+}
+
+void Look_brake() // 장애물 인식 함수
+{
+  if(R_Dist>LR_Dist_Min) //우측에 장애물이 있다면                       
+  {
+    //brake();
+    s.write('e');
+    Left(delay_t);
+  }
+  if(L_Dist>LR_Dist_Min) //좌측에 장애물이 있다면
+  {
+    //brake();
+    s.write('t');
+    Right(delay_t);
+    
+  }
+  if(F_Dist>Dist_Min) //정면에 장애물이 있다면
+  {
+    s.write('t');
+    Brake(delay_t);
+    if (L_Dist < R_Dist && L_Dist < F_Dist) //정면에 장애물 있고 우측 거리값이 더 짧다면
+      {
+        s.write('e');
+        Left(delay_t);
+      }
+      else if (R_Dist < L_Dist && R_Dist < F_Dist) //정면에 장애물 있고 좌측 거리값이 짧다면
+      {
+        s.write('t');
+        Right(delay_t);
+      }
+  }
+  
+}
+
+
+//=======모터 제어 함수 start=====
+void forward() { //직진
+  analogWrite(AIA, 0);
+  analogWrite(AIB, Max_speed1+20); //좌측 모터pwm이 우측보다 약해 약간 차이를 두었음
+  analogWrite(BIA, 0);
+  analogWrite(BIB, Max_speed1);
+}
+void Brake(float t) { //정지
+  analogWrite(AIA, 0);
+  analogWrite(AIB, 0);
+  analogWrite(BIA, 0);
+  analogWrite(BIB, 0);
+  delay(t);
+}
+void Right(float t) { //우측 모터만 반대로 회전
+  analogWrite(AIA, 0);
+  analogWrite(AIB, 0);
+  analogWrite(BIA, Max_speed2);
+  analogWrite(BIB, 0);
+  delay(t);
+}
+void Left(float t) { //좌측 모터만 반대로 회전
+  analogWrite(AIA, Max_speed2-20);
+  analogWrite(AIB, 0);
+  analogWrite(BIA, 0);
+  analogWrite(BIB, 0);
+  delay(t);
+}
+
+void right(float t) { //미사용
+  analogWrite(AIA, 0);
+  analogWrite(AIB, Max_speed2);
+  analogWrite(BIA, Max_speed2);
+  analogWrite(BIB, 0);
+  delay(t);
+
+}
+
+void left(float t) { //미사용
+  analogWrite(AIA, Max_speed2);
+  analogWrite(AIB, 0);
+  analogWrite(BIA, 0);
+  analogWrite(BIB, Max_speed2);
+  delay(t);
+}
+
+void brake() {//미사용
+  analogWrite(AIA, 0);
+  analogWrite(AIB, 0);
+  analogWrite(BIA, 0);
+  analogWrite(BIB, 0);
+}
+//======모터 제어 함수 end====
+
+float F_Filter() //정면psd센서 상보필터
+{
+  
+  sensorValue = analogRead(psd1);    //정면 적외선 센서값을 상보필터 적용해 유효한 값 범위로 반환 및 센서 평균값 도출       
+
+  EMA_S_pre = (EMA_a*sensorValue) + ((1-EMA_a)*EMA_S_pre);   //필터링 수식을 통해 필터링 된 센서값 도출(EMA_S_pre)
+
+//이동평균 필터 적용////////////////////////////
+
+sum-=buffer[0];
+for(int i =0; i<SIZE-1 ; i++)
+
+{
+
+  buffer[i]=buffer[i+1];
+
+}
+
+buffer[SIZE-1]=EMA_S_pre;
+
+sum+=buffer[SIZE-1];
+
+EMA_S=sum/SIZE+2;//이동평균필터를 통해 최종 필터링한 센서값 도출(EMA_S)
+
+////////////////////////////////
+
+
+volts=(EMA_S) * 5.0/ 1023.0;
+
+ir_distance = 604.95* pow(volts, -1.1904);//필터링된 거리값 도출
+
+ir_distance = volts*10;
+return ir_distance;
+}
+
+
+
+float L_Filter() { //좌측 psd센서 상보필터 적용
+  sensorValue2 = analogRead(psd3);    
+
+  EMA_S_pre2 = (EMA_a*sensorValue2) + ((1-EMA_a)*EMA_S_pre2);
+
+  sum2 -= buffer2[0];
+
+  for (int i = 0; i < SIZE - 1 ; i++)
+
+  {
+    buffer2[i] = buffer2[i + 1];
+  }
+
+  buffer2[SIZE - 1] = sensorValue2;
+
+  sum2 += buffer2[SIZE - 1];
+
+  EMA_S = sum2 / SIZE + 2; 
+
+  volts2 = (EMA_S) * 5.0 / 1023.0;
+
+  ir_distance2 = volts2 * 10;
+  return ir_distance2;
+}
+
+float R_Filter() { //우측 psd센서 상보필터 적용
+  sensorValue3 = analogRead(psd2);
+
+  EMA_S_pre3 = (EMA_a*sensorValue3) + ((1-EMA_a)*EMA_S_pre3);
+
+  sum3 -= buffer3[0];
+
+  for (int i = 0; i < SIZE - 1 ; i++)
+
+  {
+    buffer3[i] = buffer3[i + 1];
+  }
+
+  buffer3[SIZE - 1] = sensorValue3;
+
+  sum3 += buffer3[SIZE - 1];
+
+  EMA_S = sum3 / SIZE + 2;
+
+  volts3 = (EMA_S) * 5.0 / 1023.0;
+
+  ir_distance3 = volts3 * 10;
+
+  return ir_distance3;
+}
+
+
